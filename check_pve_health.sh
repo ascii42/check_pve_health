@@ -166,9 +166,9 @@ Options:
     --crit-updates <count>:   CRIT when >= N security updates available (default: 1)
  -eServices, --enable-services
     Per-node systemd service states (via PVE services API)
-    Enabled+running → OK; disabled/masked/static → skip
-    Failed → CRIT (use --warn-failed-service for WARN)
-    Enabled but inactive → WARN (use --ok-inactive-service to suppress)
+    Enabled+running -> OK; disabled/masked/static -> skip
+    Failed -> CRIT (use --warn-failed-service for WARN)
+    Enabled but inactive -> WARN (use --ok-inactive-service to suppress)
     --warn-failed-service:   demote failed services from CRIT to WARN
     --ok-inactive-service:   suppress WARN for enabled-but-inactive services
     --blacklist-service <svc[,svc,...]>: skip additional service names
@@ -1796,10 +1796,10 @@ if [[ ( -n "${enable_repl}" || -n "${enable_all}" ) && -z "${disable_repl}" ]]; 
 				fi
 
 				[[ "${_repl_state}" != "${status_ok}" ]] && \
-					pve_problem_output+="${_repl_state} - Replication ${_rid} (VM ${_rvmid}, ${_rsource}→${_rtarget})${_repl_detail}\n"
+					pve_problem_output+="${_repl_state} - Replication ${_rid} (VM ${_rvmid}, ${_rsource}->${_rtarget})${_repl_detail}\n"
 
 				[[ -n "${verbose}" ]] && \
-					pve_output+="${_repl_state} -   Repl ${_rid} VM ${_rvmid} (${_rsource}→${_rtarget})${_repl_age_s}${_repl_detail}\n"
+					pve_output+="${_repl_state} -   Repl ${_rid} VM ${_rvmid} (${_rsource}->${_rtarget})${_repl_age_s}${_repl_detail}\n"
 
 				_repl_lbl="${_rid//-/_}"
 				[[ "${_rlast_sync}" =~ ^[0-9]+$ && "${_rlast_sync}" -gt 0 ]] && \
@@ -2228,7 +2228,7 @@ if [[ ( -n "${enable_snap}" || -n "${enable_all}" ) && -z "${disable_snap}" ]]; 
 			fi
 
 			[[ "${_ssstate}" != "${status_ok}" ]] && \
-				pve_problem_output+="${_ssstate} - Snapshot ${_svmid}/${_svmname} → ${_ssname}: ${_ssage_days}d old\n"
+				pve_problem_output+="${_ssstate} - Snapshot ${_svmid}/${_svmname} -> ${_ssname}: ${_ssage_days}d old\n"
 			[[ -n "${verbose}" ]] && \
 				pve_output+="${_ssstate} -   VM/CT ${_svmid} ${_svmname} (${_svnode}) snap ${_ssname}: ${_ssage_days}d old\n"
 
@@ -2424,7 +2424,7 @@ if [[ ( -n "${enable_services}" || -n "${enable_all}" ) && -z "${disable_service
 	[[ -n "${verbose}" ]] && pve_output+="Services:\n---------------------------------------\n"
 
 	declare -A _svc_bl_map=()
-	# Default: skip services that are inactive when their alternatives run (chrony→timesyncd, journald→syslog)
+	# Default: skip services that are inactive when their alternatives run (chrony->timesyncd, journald->syslog)
 	for _e in syslog systemd-timesyncd; do _svc_bl_map["${_e}"]=1; done
 	if [[ -n "${service_blacklist}" ]]; then
 		IFS=',' read -ra _svc_bl_arr <<< "${service_blacklist}"

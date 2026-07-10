@@ -10,6 +10,12 @@
 # 1.1.0  2026-06-10  -eTime -eDNS -eNet -eDisk -ePSI -eSnap -eBackup -eUpdates;
 #                    -eSys: swap + load avg checks (from /nodes/{node}/status);
 #                    -s/-d/-A flags; fix silent mode separator guard
+# 1.2.0  2026-06-10  Fix storage: use .disk/.maxdisk (not .used/.total) from cluster/resources;
+#                    Fix subscription: case-insensitive notfound/expired matching;
+#                    -eTime verbose: show system time + drift value;
+#                    -eNet verbose: add cumulative traffic totals per node;
+#                    -eSys: add IOWait% from node status to verbose + perfdata;
+#                    Token format validation + auth error detection
 # 1.3.0  2026-06-10  --no-prefetch default (serial API calls); --prefetch to re-enable parallel;
 #                    --vm / --ct single item filter with detailed disk+net I/O stats
 # 1.4.0  2026-06-11  -eServices: systemd service state check via PVE services API;
@@ -17,18 +23,15 @@
 #                    --vm/--ct: CPU/mem/disk/swap/net thresholds + guest agent check;
 #                    --warn-guest-cpu/mem/disk, --warn-net-in/out thresholds for VMs/CTs;
 #                    guest CPU/mem thresholds in -eVM/-eCT loop trigger WARN/CRIT
-# 1.2.0  2026-06-10  Fix storage: use .disk/.maxdisk (not .used/.total) from cluster/resources;
-#                    Fix subscription: case-insensitive notfound/expired matching;
-#                    -eTime verbose: show system time + drift value;
-#                    -eNet verbose: add cumulative traffic totals per node;
-#                    -eSys: add IOWait% from node status to verbose + perfdata;
-#                    Token format validation + auth error detection
+# 1.5.0  2026-07-10  --blacklist-agent <pattern[,pattern,...]>: skip agent check for
+#                    matching VMs when --warn-agent is active; patterns are ERE regex
+#                    matched against VMID and name
 
 
 ## VARIABLES
 PROGNAME="${0##*/}"
 PROGPATH="${0%/*}"
-REVISION="1.4.0"
+REVISION="1.5.0"
 JQ="$(which jq)"
 CURL="$(which curl)"
 AWK="$(which awk)"
@@ -76,9 +79,9 @@ Options:
  --port <port>
     API port (default: 8006)
  -T, --token, -a <token>
-    API token — FULL format required: USER@REALM!TOKENID=SECRET
+    API token - FULL format required: USER@REALM!TOKENID=SECRET
     Example: -T 'root@pam!monitoring=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-    Use single quotes — bash expands '!' in double quotes (history expansion)
+    Use single quotes - bash expands '!' in double quotes (history expansion)
     (PVE GUI: Datacenter > Permissions > API Tokens > Add)
  -U, --username <user@realm>
     Username for password authentication (e.g. root@pam)
@@ -88,7 +91,7 @@ Options:
  --node <name>
     Restrict checks to a specific node (default: all nodes in cluster)
 
- Enable flags (opt-in — at least one -eX flag is required):
+ Enable flags (opt-in - at least one -eX flag is required):
  -eSys,     --enable-sys
     Per-node system resources: CPU%, memory%, swap%, uptime, load average
     Thresholds: -wCPU/-cCPU (default: 80/95%), -wMem/-cMem (default: 80/95%)
@@ -185,6 +188,7 @@ Options:
     fetches detailed metrics: CPU, mem, swap, disk, I/O rates, net rates
     guest thresholds (--warn-guest-cpu/mem/disk, --warn-net-in/out) trigger WARN/CRIT
     --warn-agent: warn if QEMU guest agent is not running on the selected VM
+    --blacklist-agent <name[,name,...]>: skip agent check for matching VMs (ERE regex, matched against VMID or name)
  --ct <vmid|name>
     Restrict -eCT output to a single container (by VMID or name);
     fetches detailed metrics: CPU, mem, swap, disk, I/O rates, net rates
@@ -365,6 +369,7 @@ while [[ -n "${1}" ]]; do
 	--vm)                   shift; vm_filter="${1}" ;;
 	--ct)                   shift; ct_filter="${1}" ;;
 	--warn-agent)           warn_agent=1 ;;
+	--blacklist-agent)      shift; agent_blacklist="${1}" ;;
 	--blacklist-snap)       shift; snap_blacklist="${1}" ;;
 	--blacklist-backup)     shift; backup_blacklist="${1}" ;;
 
@@ -535,7 +540,7 @@ else
 	_pve_ticket=$(echo "${_auth_resp}" | "${JQ}" -r '.data.ticket // empty' 2>/dev/null)
 	_pve_csrf=$(echo "${_auth_resp}"   | "${JQ}" -r '.data.CSRFPreventionToken // empty' 2>/dev/null)
 	if [[ -z "${_pve_ticket}" ]]; then
-		exit_unknown "Authentication failed — no ticket received (check credentials)"
+		exit_unknown "Authentication failed - no ticket received (check credentials)"
 	fi
 	pve_api_get() {
 		${CURL} ${CURL_OPTS} \
@@ -586,7 +591,7 @@ if [[ -z "${_auth_check}" || "${_auth_check}" == "null" ]]; then
 	elif [[ -n "${_raw_err}" ]]; then
 		exit_unknown "PVE API authentication failed: ${_raw_err}"
 	else
-		exit_unknown "PVE API returned no node data — check token permissions (requires PVEAuditor role)"
+		exit_unknown "PVE API returned no node data - check token permissions (requires PVEAuditor role)"
 	fi
 fi
 
@@ -1012,16 +1017,29 @@ if [[ ( -n "${enable_vm}" || -n "${enable_all}" ) && -z "${disable_vm}" ]]; then
 				[[ "${_vm_state}" == "${status_ok}" ]] && { _vm_state="${status_warn}"; (( _vm_any_warn++ )); }
 				pve_problem_output+="${status_warn} - VM ${_vmid}/${_vmname} (${_vmnode}): Mem ${_mem_pct}% >= ${warn_guest_mem}%\n"
 			fi
-			# QEMU guest agent check (--warn-agent) — result stored for verbose output below
+			# QEMU guest agent check (--warn-agent) - result stored for verbose output below
 			_vagent_state=""
 			if [[ -n "${warn_agent}" ]]; then
-				_vagent_buf=$(pve_api_get "${PVE_API}/nodes/${_vmnode}/qemu/${_vmid}/agent/info" 2>/dev/null)
-				if echo "${_vagent_buf}" | "${JQ}" -e '.data' >/dev/null 2>&1; then
-					_vagent_state="ok"
-				else
-					_vagent_state="warn"
-					[[ "${_vm_state}" == "${status_ok}" ]] && { _vm_state="${status_warn}"; (( _vm_any_warn++ )); }
-					pve_problem_output+="${status_warn} - VM ${_vmid}/${_vmname} (${_vmnode}): QEMU guest agent not running\n"
+				_vagent_skip=0
+				if [[ -n "${agent_blacklist}" ]]; then
+					IFS=',' read -ra _abl <<< "${agent_blacklist}"
+					for _ae in "${_abl[@]}"; do
+						[[ -z "${_ae}" ]] && continue
+						if echo "${_vmid}" | grep -qE "${_ae}" 2>/dev/null || \
+						   echo "${_vmname}" | grep -qE "${_ae}" 2>/dev/null; then
+							_vagent_skip=1; break
+						fi
+					done
+				fi
+				if [[ "${_vagent_skip}" -eq 0 ]]; then
+					_vagent_buf=$(pve_api_get "${PVE_API}/nodes/${_vmnode}/qemu/${_vmid}/agent/info" 2>/dev/null)
+					if echo "${_vagent_buf}" | "${JQ}" -e '.data' >/dev/null 2>&1; then
+						_vagent_state="ok"
+					else
+						_vagent_state="warn"
+						[[ "${_vm_state}" == "${status_ok}" ]] && { _vm_state="${status_warn}"; (( _vm_any_warn++ )); }
+						pve_problem_output+="${status_warn} - VM ${_vmid}/${_vmname} (${_vmnode}): QEMU guest agent not running\n"
+					fi
 				fi
 			fi
 		fi
@@ -1066,7 +1084,7 @@ if [[ ( -n "${enable_vm}" || -n "${enable_all}" ) && -z "${disable_vm}" ]]; then
 	# Detailed metrics for single selected VM (--vm)
 	if [[ -n "${vm_filter}" && -n "${_vm_sel_id}" ]]; then
 		_vm_lbl="${_vm_sel_id}_${vm_filter//[^a-zA-Z0-9]/_}"
-		# rrddata: last non-null sample — cpu (0-1), mem, maxmem, disk, maxdisk, swap, maxswap, rates
+		# rrddata: last non-null sample - cpu (0-1), mem, maxmem, disk, maxdisk, swap, maxswap, rates
 		_vr_buf=$(pve_api_get "${PVE_API}/nodes/${_vm_sel_node}/qemu/${_vm_sel_id}/rrddata?timeframe=hour&cf=AVERAGE" 2>/dev/null)
 		_vr_vals=$(echo "${_vr_buf}" | "${JQ}" -r \
 			'.data | map(select(.cpu != null)) | last |
@@ -1114,7 +1132,7 @@ if [[ ( -n "${enable_vm}" || -n "${enable_all}" ) && -z "${disable_vm}" ]]; then
 		elif [[ "${_vd_cpu_pct_i}" -ge "${warn_guest_cpu}" ]] 2>/dev/null; then _vds_cpu="${status_warn}"; fi
 		if [[ "${_vd_mem_pct_i}" -ge "${crit_guest_mem}" ]] 2>/dev/null;   then _vds_mem="${status_crit}"
 		elif [[ "${_vd_mem_pct_i}" -ge "${warn_guest_mem}" ]] 2>/dev/null; then _vds_mem="${status_warn}"; fi
-		# Disk/swap/net thresholds not in loop — check here with counter+problem_output
+		# Disk/swap/net thresholds not in loop - check here with counter+problem_output
 		if [[ "${_vd_maxdisk_i}" -gt 0 ]]; then
 			if [[ "${_vd_disk_pct_i}" -ge "${crit_guest_disk}" ]] 2>/dev/null; then
 				_vds_disk="${status_crit}"; (( _vm_any_crit++ ))
@@ -1363,7 +1381,7 @@ if [[ ( -n "${enable_ct}" || -n "${enable_all}" ) && -z "${disable_ct}" ]]; then
 	# Detailed metrics for single selected CT (--ct)
 	if [[ -n "${ct_filter}" && -n "${_ct_sel_id}" ]]; then
 		_ct_lbl="${_ct_sel_id}_${ct_filter//[^a-zA-Z0-9]/_}"
-		# rrddata: last non-null sample — cpu (0-1), mem, maxmem, disk, maxdisk, swap, maxswap, rates
+		# rrddata: last non-null sample - cpu (0-1), mem, maxmem, disk, maxdisk, swap, maxswap, rates
 		_cr_buf=$(pve_api_get "${PVE_API}/nodes/${_ct_sel_node}/lxc/${_ct_sel_id}/rrddata?timeframe=hour&cf=AVERAGE" 2>/dev/null)
 		_cr_vals=$(echo "${_cr_buf}" | "${JQ}" -r \
 			'.data | map(select(.cpu != null)) | last |
@@ -2166,7 +2184,7 @@ if [[ ( -n "${enable_psi}" || -n "${enable_all}" ) && -z "${disable_psi}" ]]; th
 		[[ "${_pstate}" != "${status_ok}" ]] && \
 			pve_problem_output+="${_pstate} - PSI ${_pnode}:${_pdetail}\n"
 		[[ -n "${verbose}" ]] && \
-			pve_output+="${_pstate} - Node ${_pnode}: pressure avg10 —${_pdetail:- all OK}\n"
+			pve_output+="${_pstate} - Node ${_pnode}: pressure avg10 - ${_pdetail:- all OK}\n"
 	done
 
 	if [[ "${_psi_any_crit}" -gt 0 ]]; then
@@ -2202,7 +2220,7 @@ if [[ ( -n "${enable_snap}" || -n "${enable_all}" ) && -z "${disable_snap}" ]]; 
 		[[ -n "${_snap_bl_map[${_svmid}]:-}" || -n "${_snap_bl_map[${_svmname}]:-}" ]] && continue
 		[[ -n "${pve_node}" && "${_svnode}" != "${pve_node}" ]] && continue
 
-		# Serial per-VM call — parallelising hundreds of VMs is excessive
+		# Serial per-VM call - parallelising hundreds of VMs is excessive
 		case "${_svtype}" in
 			qemu) _ssnap_url="${PVE_API}/nodes/${_svnode}/qemu/${_svmid}/snapshot" ;;
 			lxc)  _ssnap_url="${PVE_API}/nodes/${_svnode}/lxc/${_svmid}/snapshot"  ;;
@@ -2261,7 +2279,7 @@ if [[ ( -n "${enable_snap}" || -n "${enable_all}" ) && -z "${disable_snap}" ]]; 
 fi
 
 # ---------------------------------------------------------------------------
-# Backup Status Check (-eBackup)  — NOT included in -eAll
+# Backup Status Check (-eBackup)  - NOT included in -eAll
 # ---------------------------------------------------------------------------
 if [[ -n "${enable_backup}" ]]; then
 	[[ -n "${verbose}" ]] && pve_output+="Backup Status:\n---------------------------------------\n"
@@ -2486,7 +2504,7 @@ if [[ ( -n "${enable_services}" || -n "${enable_all}" ) && -z "${disable_service
 fi
 
 # ---------------------------------------------------------------------------
-# Task Log Check (-eLog)  — NOT included in -eAll
+# Task Log Check (-eLog)  - NOT included in -eAll
 # ---------------------------------------------------------------------------
 if [[ -n "${enable_log}" ]]; then
 	# When a specific VM or CT is selected, restrict log to that VMID

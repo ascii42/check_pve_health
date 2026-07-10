@@ -26,12 +26,17 @@
 # 1.5.0  2026-07-10  --blacklist-agent <pattern[,pattern,...]>: skip agent check for
 #                    matching VMs when --warn-agent is active; patterns are ERE regex
 #                    matched against VMID and name
+# 1.6.0  2026-07-10  -eVcpuRatio: per-node vCPU:pCPU ratio + cluster total (when
+#                    more than one node); running VM vCPUs / node pCPU threads from
+#                    cluster/resources; --warn-vcpuratio/--crit-vcpuratio thresholds;
+#                    respects --node filter; perfdata per-node + cluster total;
+#                    included in -eAll
 
 
 ## VARIABLES
 PROGNAME="${0##*/}"
 PROGPATH="${0%/*}"
-REVISION="1.5.0"
+REVISION="1.6.0"
 JQ="$(which jq)"
 CURL="$(which curl)"
 AWK="$(which awk)"
@@ -193,10 +198,15 @@ Options:
     Restrict -eCT output to a single container (by VMID or name);
     fetches detailed metrics: CPU, mem, swap, disk, I/O rates, net rates
     guest thresholds (--warn-guest-cpu/mem/disk, --warn-net-in/out) trigger WARN/CRIT
+ -eVcpuRatio, --enable-vcpuratio
+    Cluster-wide vCPU:pCPU ratio (sum of running VM vCPUs / sum of node physical CPU threads)
+    --warn-vcpuratio <N>: WARN when ratio >= N (default: disabled)
+    --crit-vcpuratio <N>: CRIT when ratio >= N (default: disabled)
  -eAll, -A, --enable-all
     Enable all checks (note: -eBackup and -eLog are never included in -eAll)
 
  Disable flags (useful with -eAll):
+ --disable-vcpuratio
  --disable-sys       --disable-cluster     --disable-vm
  --disable-ct        --disable-storage     --disable-sub
  --disable-repl      --disable-time        --disable-dns
@@ -306,6 +316,7 @@ while [[ -n "${1}" ]]; do
 	-eUpdates|--enable-updates) enable_updates=1 ;;
 	-eServices|--enable-services) enable_services=1 ;;
 	-eLog|--enable-log)         enable_log=1 ;;
+	-eVcpuRatio|--enable-vcpuratio) enable_vcpuratio=1 ;;
 	-eAll|-A|--enable-all)      enable_all=1 ;;
 
 	# Disable flags
@@ -322,8 +333,9 @@ while [[ -n "${1}" ]]; do
 	--disable-net)     disable_net=1 ;;
 	--disable-disk)    disable_disk=1 ;;
 	--disable-psi)     disable_psi=1 ;;
-	--disable-snap)    disable_snap=1 ;;
-	--disable-updates) disable_updates=1 ;;
+	--disable-snap)         disable_snap=1 ;;
+	--disable-updates)      disable_updates=1 ;;
+	--disable-vcpuratio)    disable_vcpuratio=1 ;;
 
 	# CPU/memory thresholds
 	-wCPU|--warn-cpu)  shift; warn_cpu="${1}" ;;
@@ -370,6 +382,8 @@ while [[ -n "${1}" ]]; do
 	--ct)                   shift; ct_filter="${1}" ;;
 	--warn-agent)           warn_agent=1 ;;
 	--blacklist-agent)      shift; agent_blacklist="${1}" ;;
+	--warn-vcpuratio)       shift; warn_vcpuratio="${1}" ;;
+	--crit-vcpuratio)       shift; crit_vcpuratio="${1}" ;;
 	--blacklist-snap)       shift; snap_blacklist="${1}" ;;
 	--blacklist-backup)     shift; backup_blacklist="${1}" ;;
 
@@ -457,7 +471,7 @@ _any_enabled=0
 for _ef in enable_sys enable_cluster enable_vm enable_ct enable_storage \
            enable_sub enable_repl enable_time enable_dns enable_net enable_disk \
            enable_psi enable_snap enable_backup enable_updates \
-           enable_services enable_log enable_all; do
+           enable_services enable_log enable_vcpuratio enable_all; do
 	[[ -n "${!_ef}" ]] && { _any_enabled=1; break; }
 done
 [[ "${_any_enabled}" -eq 0 ]] && { echo "Error: at least one -eX check flag required"; print_usage; exit 3; }
@@ -1262,6 +1276,60 @@ if [[ ( -n "${enable_vm}" || -n "${enable_all}" ) && -z "${disable_vm}" ]]; then
 	[[ "${_vm_paused}" -gt 0 ]] && pve_perf+=" vm_paused=${_vm_paused}"
 
 	unset _vm_bl_map
+	[[ -n "${verbose}" ]] && pve_output+="---------------------------------------\n\n"
+fi
+
+# ---------------------------------------------------------------------------
+# vCPU:pCPU Ratio Check (-eVcpuRatio)
+# ---------------------------------------------------------------------------
+if [[ ( -n "${enable_vcpuratio}" || -n "${enable_all}" ) && -z "${disable_vcpuratio}" ]]; then
+	[[ -n "${verbose}" ]] && pve_output+="vCPU:pCPU Ratio:\n---------------------------------------\n"
+
+	_vr_cl_pcpu=0; _vr_cl_vcpu=0; _vr_cl_state="${status_ok}"
+	_vr_node_buf=""; _vr_node_count=0
+
+	for _vrn in "${_all_nodes[@]}"; do
+		_vr_pcpu=$(echo "${_res_buf}" | "${JQ}" -r --arg n "${_vrn}" \
+			'.data[]? | select(.type=="node" and .node==$n) | (.maxcpu // 0)' 2>/dev/null)
+		_vr_vcpu=$(echo "${_res_buf}" | "${JQ}" -r --arg n "${_vrn}" \
+			'[ .data[]? | select(.type=="qemu" and .status=="running" and .node==$n) | (.maxcpu // 0) ] | add // 0' 2>/dev/null)
+		_vr_pcpu="${_vr_pcpu:-0}"; _vr_vcpu="${_vr_vcpu:-0}"
+		(( _vr_cl_pcpu += _vr_pcpu )); (( _vr_cl_vcpu += _vr_vcpu ))
+		(( _vr_node_count++ ))
+
+		_vr_state="${status_ok}"
+		if [[ "${_vr_pcpu}" -gt 0 ]] 2>/dev/null; then
+			_vr_ratio=$(awk "BEGIN{printf \"%.2f\",${_vr_vcpu}/${_vr_pcpu}}" 2>/dev/null)
+			if [[ -n "${crit_vcpuratio}" ]] && \
+			   awk "BEGIN{exit(${_vr_vcpu}/${_vr_pcpu}>=${crit_vcpuratio}?0:1)}" 2>/dev/null; then
+				_vr_state="${status_crit}"; _vr_cl_state="${status_crit}"
+				pve_problem_output+="${status_crit} - ${_vrn}: vCPU:pCPU ratio ${_vr_ratio}:1 >= ${crit_vcpuratio}:1 crit (${_vr_vcpu} vCPUs / ${_vr_pcpu} cores)\n"
+			elif [[ -n "${warn_vcpuratio}" ]] && \
+			     awk "BEGIN{exit(${_vr_vcpu}/${_vr_pcpu}>=${warn_vcpuratio}?0:1)}" 2>/dev/null; then
+				_vr_state="${status_warn}"
+				[[ "${_vr_cl_state}" == "${status_ok}" ]] && _vr_cl_state="${status_warn}"
+				pve_problem_output+="${status_warn} - ${_vrn}: vCPU:pCPU ratio ${_vr_ratio}:1 >= ${warn_vcpuratio}:1 warn (${_vr_vcpu} vCPUs / ${_vr_pcpu} cores)\n"
+			fi
+			_vr_node_buf+="   \\_ ${_vr_state} ${_vrn}: ${_vr_ratio}:1 (${_vr_vcpu} vCPUs / ${_vr_pcpu} cores)\n"
+			_vrn_lbl="${_vrn//-/_}"
+			pve_perf+=" vcpu_ratio_${_vrn_lbl}=${_vr_ratio};${warn_vcpuratio:-};${crit_vcpuratio:-};;"
+			pve_perf+=" vcpus_${_vrn_lbl}=${_vr_vcpu};;;; pcpus_${_vrn_lbl}=${_vr_pcpu};;;;"
+		fi
+	done
+
+	if [[ "${_vr_cl_pcpu}" -gt 0 ]] 2>/dev/null; then
+		_vr_cl_ratio=$(awk "BEGIN{printf \"%.2f\",${_vr_cl_vcpu}/${_vr_cl_pcpu}}" 2>/dev/null)
+		if [[ "${_vr_node_count}" -gt 1 ]]; then
+			pve_output+="${_vr_cl_state} - vCPU:pCPU ratio ${_vr_cl_ratio}:1 (${_vr_cl_vcpu} vCPUs / ${_vr_cl_pcpu} cores cluster total)\n"
+			pve_output+="${_vr_node_buf}"
+		else
+			pve_output+="${_vr_cl_state} - vCPU:pCPU ratio ${_vr_cl_ratio}:1 (${_vr_cl_vcpu} vCPUs / ${_vr_cl_pcpu} cores)\n"
+		fi
+		pve_perf+=" vcpu_ratio=${_vr_cl_ratio};${warn_vcpuratio:-};${crit_vcpuratio:-};; vcpus=${_vr_cl_vcpu};;;; pcpus=${_vr_cl_pcpu};;;;"
+	else
+		pve_output+="${status_unknown} - vCPU:pCPU ratio: no node CPU data available\n"
+	fi
+
 	[[ -n "${verbose}" ]] && pve_output+="---------------------------------------\n\n"
 fi
 

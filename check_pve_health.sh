@@ -703,6 +703,9 @@ if [[ ( -n "${enable_sys}" || -n "${enable_all}" ) && -z "${disable_sys}" ]]; th
 	while IFS=$'\t' read -r _snode _scpu _smaxcpu _smem _smaxmem _sdisk _smaxdisk _suptime; do
 		[[ -z "${_snode}" ]] && continue
 
+		# Node filter
+        [[ -n "${pve_node}" && "${_snode}" != "${pve_node}" ]] && continue
+
 		# CPU: value from API is 0..1 float
 		_cpu_pct=$(echo "${_scpu}" | "${AWK}" '{printf "%d", $1*100+0.5}')
 

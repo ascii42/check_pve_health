@@ -31,12 +31,15 @@
 #                    cluster/resources; --warn-vcpuratio/--crit-vcpuratio thresholds;
 #                    respects --node filter; perfdata per-node + cluster total;
 #                    included in -eAll
+# 1.6.1  2026-08-17  -eDisk: accept "OK" as a healthy SMART status alongside "PASSED"
+#                    and "UNKNOWN"; some controllers/drives (e.g. NVMe/SAS on PVE)
+#                    report health as "OK" which was incorrectly triggering WARNING
 
 
 ## VARIABLES
 PROGNAME="${0##*/}"
 PROGPATH="${0%/*}"
-REVISION="1.6.0"
+REVISION="1.6.1"
 JQ="$(which jq)"
 CURL="$(which curl)"
 AWK="$(which awk)"
@@ -2158,7 +2161,7 @@ if [[ ( -n "${enable_disk}" || -n "${enable_all}" ) && -z "${disable_disk}" ]]; 
 			if [[ "${_dkhealth}" == "FAILED" ]]; then
 				_dkstate="${status_crit}"; (( _disk_any_crit++ ))
 				_dkdetail=" SMART: FAILED"
-			elif [[ "${_dkhealth}" != "PASSED" && "${_dkhealth}" != "UNKNOWN" && -n "${_dkhealth}" ]]; then
+			elif [[ "${_dkhealth}" != "PASSED" && "${_dkhealth}" != "OK" && "${_dkhealth}" != "UNKNOWN" && -n "${_dkhealth}" ]]; then
 				_dkstate="${status_warn}"; (( _disk_any_warn++ ))
 				_dkdetail=" SMART: ${_dkhealth}"
 			fi

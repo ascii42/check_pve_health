@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Shell Script](https://img.shields.io/badge/Shell-Bash-green.svg)](https://www.gnu.org/software/bash/)
 [![Monitoring](https://img.shields.io/badge/Monitoring-Icinga%2FNagios-blue.svg)](https://icinga.com/)
-[![Version](https://img.shields.io/badge/version-1.4.0-orange.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.6.1-orange.svg)](CHANGELOG.md)
 
 A comprehensive Bash-based monitoring plugin for Proxmox Virtual Environment (PVE), compatible with Icinga and Nagios monitoring systems. This plugin monitors cluster health, nodes, virtual machines, containers, storage, subscriptions, replication, services, task logs, and more — directly via the Proxmox REST API. No agent or additional software required on the PVE hosts.
 

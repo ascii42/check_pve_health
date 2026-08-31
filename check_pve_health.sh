@@ -34,12 +34,20 @@
 # 1.6.1  2026-08-17  -eDisk: accept "OK" as a healthy SMART status alongside "PASSED"
 #                    and "UNKNOWN"; some controllers/drives (e.g. NVMe/SAS on PVE)
 #                    report health as "OK" which was incorrectly triggering WARNING
+# 1.7.0  2026-08-25  -eDisk: add "Type:" and "Smart:" labels to verbose and problem
+#                    output so "UNKNOWN" is clearly attributed to SMART, not a generic
+#                    unknown state
+# 1.8.0  2026-08-25  -ePSI: fix for PVE 9.x - pressure data moved from node status
+#                    to rrddata endpoint (fields: pressurecpusome, pressurememorysome,
+#                    pressurememoryfull, pressureiosome, pressureiofull); script now
+#                    tries node status first (PVE 8.x), falls back to rrddata (PVE 9.x);
+#                    rrddata prefetched automatically when -ePSI is active
 
 
 ## VARIABLES
 PROGNAME="${0##*/}"
 PROGPATH="${0%/*}"
-REVISION="1.6.1"
+REVISION="1.8.0"
 JQ="$(which jq)"
 CURL="$(which curl)"
 AWK="$(which awk)"
@@ -634,8 +642,9 @@ for _pfn in "${_all_nodes[@]}"; do
         _pf_get "${PVE_API}/nodes/${_pfn}/dns"        "node_dns_${_pfn}.json"
     [[ ( -n "${enable_net}"  || -n "${enable_all}" ) && -z "${disable_net}"  ]] && \
         _pf_get "${PVE_API}/nodes/${_pfn}/network"    "node_net_${_pfn}.json"
-    [[ ( -n "${enable_net}"  || -n "${enable_all}" ) && -z "${disable_net}" && \
-       ( -n "${warn_net_in}" || -n "${crit_net_in}" || -n "${warn_net_out}" || -n "${crit_net_out}" ) ]] && \
+    [[ ( ( -n "${enable_net}" || -n "${enable_all}" ) && -z "${disable_net}" && \
+         ( -n "${warn_net_in}" || -n "${crit_net_in}" || -n "${warn_net_out}" || -n "${crit_net_out}" ) ) || \
+       ( ( -n "${enable_psi}" || -n "${enable_all}" ) && -z "${disable_psi}" ) ]] && \
         _pf_get "${PVE_API}/nodes/${_pfn}/rrddata?timeframe=hour&cf=AVERAGE" "node_rrd_${_pfn}.json"
     [[ ( -n "${enable_disk}" || -n "${enable_all}" ) && -z "${disable_disk}" ]] && \
         _pf_get "${PVE_API}/nodes/${_pfn}/disks/list" "node_disks_${_pfn}.json"
@@ -2182,11 +2191,11 @@ if [[ ( -n "${enable_disk}" || -n "${enable_all}" ) && -z "${disable_disk}" ]]; 
 			fi
 
 			[[ "${_dkstate}" != "${status_ok}" ]] && \
-				pve_problem_output+="${_dkstate} - Disk ${_dknode}/${_dkdev##*/} (${_dkmodel}):${_dkdetail}\n"
+				pve_problem_output+="${_dkstate} - Disk ${_dknode}/${_dkdev##*/} (${_dkmodel}, Type: ${_dktype}):${_dkdetail}\n"
 			[[ -n "${verbose}" ]] && {
 				_dksize_s=$(_fmt_bytes "${_dksize}")
 				_dkwear_s=""; [[ "${_dkwear}" =~ ^[0-9]+$ ]] && _dkwear_s=", wear: ${_dkwear}%"
-				pve_output+="${_dkstate} -   ${_dknode}/${_dkdev##*/} (${_dkmodel}, ${_dktype}, ${_dksize_s}): ${_dkhealth:-UNKNOWN}${_dkwear_s}${_dkdetail}\n"
+				pve_output+="${_dkstate} -   ${_dknode}/${_dkdev##*/} (${_dkmodel}, Type: ${_dktype}, ${_dksize_s}): Smart: ${_dkhealth:-UNKNOWN}${_dkwear_s}${_dkdetail}\n"
 			}
 		done < <(echo "${_dkbuf}" | "${JQ}" --unbuffered -r '
 			.data[]? | [
@@ -2220,10 +2229,25 @@ if [[ ( -n "${enable_psi}" || -n "${enable_all}" ) && -z "${disable_psi}" ]]; th
 
 	for _pnode in "${_all_nodes[@]}"; do
 		_pstbuf=$(cat "${_pf}/node_status_${_pnode}.json" 2>/dev/null)
-		[[ -z "${_pstbuf}" ]] && continue
+		_prrd_buf=$(cat "${_pf}/node_rrd_${_pnode}.json"   2>/dev/null)
 
 		_pstate="${status_ok}"; _pdetail=""
 		_plbl="${_pnode//-/_}"
+
+		# PVE 8.x: pressure in node status (.data.pressure)
+		# PVE 9.x: pressure moved to rrddata (pressure* fields, 1-min RRD averages)
+		_psi_in_status=0
+		_psi_in_rrd=0
+		echo "${_pstbuf}" | "${JQ}" -e '.data.pressure' >/dev/null 2>&1 && _psi_in_status=1
+		echo "${_prrd_buf}" | "${JQ}" -e \
+			'.data | map(select(.pressurecpusome != null)) | last | .pressurecpusome != null' \
+			>/dev/null 2>&1 && _psi_in_rrd=1
+
+		if [[ "${_psi_in_status}" -eq 0 && "${_psi_in_rrd}" -eq 0 ]]; then
+			[[ -n "${verbose}" ]] && \
+				pve_output+="${status_ok} - Node ${_pnode}: PSI not available (PVE < 8.1 or kernel < 4.20)\n"
+			continue
+		fi
 
 		while IFS=$'\t' read -r _prestype _pavg10 _pavg60 _pavg300; do
 			[[ -z "${_prestype}" || "${_pavg10}" == "null" ]] && continue
@@ -2239,26 +2263,34 @@ if [[ ( -n "${enable_psi}" || -n "${enable_all}" ) && -z "${disable_psi}" ]]; th
 				_pdetail+=" ${_prestype}:${_pavg10}%"
 			fi
 
-			pve_perf+=" psi_${_plbl}_${_prestype}_avg10=${_pavg10};${warn_psi};${crit_psi};0;100"
-			pve_perf+=" psi_${_plbl}_${_prestype}_avg60=${_pavg60}"
-		done < <(echo "${_pstbuf}" | "${JQ}" --unbuffered -r '
-			.data.pressure // {} | to_entries[]? | [
-				.key,
-				((.value.avg10  // "null") | tostring),
-				((.value.avg60  // "null") | tostring),
-				((.value.avg300 // "null") | tostring)
-			] | join("\t")' 2>/dev/null)
-
-		if [[ -z "${_pdetail}" ]] && ! echo "${_pstbuf}" | "${JQ}" -e '.data.pressure' >/dev/null 2>&1; then
-			[[ -n "${verbose}" ]] && \
-				pve_output+="${status_ok} - Node ${_pnode}: PSI not available (PVE < 8.1 or kernel < 4.20)\n"
-			continue
-		fi
+			pve_perf+=" psi_${_plbl}_${_prestype}=${_pavg10};${warn_psi};${crit_psi};0;100"
+		done < <(
+			if [[ "${_psi_in_status}" -eq 1 ]]; then
+				echo "${_pstbuf}" | "${JQ}" --unbuffered -r '
+					.data.pressure // {} | to_entries[]? |
+					.key as $type | .value |
+					if has("avg10") then
+						[($type), ((.avg10 // "null") | tostring), ((.avg60 // "null") | tostring), ((.avg300 // "null") | tostring)]
+					else
+						to_entries[]? | [($type + "_" + .key), ((.value.avg10 // "null") | tostring), ((.value.avg60 // "null") | tostring), ((.value.avg300 // "null") | tostring)]
+					end | join("\t")' 2>/dev/null
+			else
+				echo "${_prrd_buf}" | "${JQ}" --unbuffered -r '
+					.data | map(select(.pressurecpusome != null)) | last |
+					[
+						["cpu_some",    (.pressurecpusome    // 0 | tostring)],
+						["memory_some", (.pressurememorysome // 0 | tostring)],
+						["memory_full", (.pressurememoryfull // 0 | tostring)],
+						["io_some",     (.pressureiosome     // 0 | tostring)],
+						["io_full",     (.pressureiofull     // 0 | tostring)]
+					] | .[] | [.[0], .[1], .[1], .[1]] | join("\t")' 2>/dev/null
+			fi
+		)
 
 		[[ "${_pstate}" != "${status_ok}" ]] && \
 			pve_problem_output+="${_pstate} - PSI ${_pnode}:${_pdetail}\n"
 		[[ -n "${verbose}" ]] && \
-			pve_output+="${_pstate} - Node ${_pnode}: pressure avg10 - ${_pdetail:- all OK}\n"
+			pve_output+="${_pstate} - Node ${_pnode}: pressure - ${_pdetail:- all OK}\n"
 	done
 
 	if [[ "${_psi_any_crit}" -gt 0 ]]; then

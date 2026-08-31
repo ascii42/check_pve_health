@@ -34,10 +34,10 @@
 # 1.6.1  2026-08-17  -eDisk: accept "OK" as a healthy SMART status alongside "PASSED"
 #                    and "UNKNOWN"; some controllers/drives (e.g. NVMe/SAS on PVE)
 #                    report health as "OK" which was incorrectly triggering WARNING
-# 1.7.0  2026-08-25  -eDisk: add "Type:" and "Smart:" labels to verbose and problem
+# 1.6.2  2026-08-25  -eDisk: add "Type:" and "Smart:" labels to verbose and problem
 #                    output so "UNKNOWN" is clearly attributed to SMART, not a generic
 #                    unknown state
-# 1.8.0  2026-08-25  -ePSI: fix for PVE 9.x - pressure data moved from node status
+# 1.7.0  2026-08-25  -ePSI: fix for PVE 9.x - pressure data moved from node status
 #                    to rrddata endpoint (fields: pressurecpusome, pressurememorysome,
 #                    pressurememoryfull, pressureiosome, pressureiofull); script now
 #                    tries node status first (PVE 8.x), falls back to rrddata (PVE 9.x);
@@ -47,7 +47,7 @@
 ## VARIABLES
 PROGNAME="${0##*/}"
 PROGPATH="${0%/*}"
-REVISION="1.8.0"
+REVISION="1.7.0"
 JQ="$(which jq)"
 CURL="$(which curl)"
 AWK="$(which awk)"

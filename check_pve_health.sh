@@ -42,12 +42,17 @@
 #                    pressurememoryfull, pressureiosome, pressureiofull); script now
 #                    tries node status first (PVE 8.x), falls back to rrddata (PVE 9.x);
 #                    rrddata prefetched automatically when -ePSI is active
+# 1.8.0  2026-09-01  -eCeph: Ceph cluster health (HEALTH_OK/WARN/ERR, OSD counts,
+#                    PG count, capacity usage); -eHA: HA resource manager status
+#                    (master node, resource states, error/fence detection);
+#                    -eOVS: OpenVSwitch interface status per node (CRIT on any down);
+#                    --disable-ceph/--disable-ha/--disable-ovs flags
 
 
 ## VARIABLES
 PROGNAME="${0##*/}"
 PROGPATH="${0%/*}"
-REVISION="1.7.0"
+REVISION="1.8.0"
 JQ="$(which jq)"
 CURL="$(which curl)"
 AWK="$(which awk)"
@@ -167,6 +172,15 @@ Options:
     Per-node CPU/memory/IO pressure stall (PSI, PVE 8.1+, Linux kernel 4.20+)
     --warn-psi <pct>:         WARN when any avg10 pressure > N% (default: 20)
     --crit-psi <pct>:         CRIT when any avg10 pressure > N% (default: 50)
+ -eCeph,    --enable-ceph
+    Ceph cluster health: OSD status, PG count, capacity usage
+    CRIT on HEALTH_ERR; WARN on HEALTH_WARN; OK when not initialized
+ -eHA,      --enable-ha
+    HA resource manager: master node presence and resource state breakdown
+    CRIT when any resource is in error or fence state
+ -eOVS,     --enable-ovs
+    OpenVSwitch interface status per node (OVSBridge/OVSPort/OVSIntPort/OVSBond)
+    CRIT when any OVS interface is not active
  -eSnap,    --enable-snap
     VM/CT snapshot age/count (requires per-VM API calls)
     --warn-snap-age <days>:   WARN when snapshot older than N days (default: 7)
@@ -223,6 +237,7 @@ Options:
  --disable-repl      --disable-time        --disable-dns
  --disable-net       --disable-disk        --disable-psi
  --disable-snap      --disable-updates     --disable-services
+ --disable-ceph      --disable-ha          --disable-ovs
 
  Threshold options:
  -wCPU, --warn-cpu <pct>       CPU warn threshold (default: 80)
@@ -328,6 +343,9 @@ while [[ -n "${1}" ]]; do
 	-eServices|--enable-services) enable_services=1 ;;
 	-eLog|--enable-log)         enable_log=1 ;;
 	-eVcpuRatio|--enable-vcpuratio) enable_vcpuratio=1 ;;
+	-eCeph|--enable-ceph)       enable_ceph=1 ;;
+	-eHA|--enable-ha)           enable_ha=1 ;;
+	-eOVS|--enable-ovs)         enable_ovs=1 ;;
 	-eAll|-A|--enable-all)      enable_all=1 ;;
 
 	# Disable flags
@@ -347,6 +365,9 @@ while [[ -n "${1}" ]]; do
 	--disable-snap)         disable_snap=1 ;;
 	--disable-updates)      disable_updates=1 ;;
 	--disable-vcpuratio)    disable_vcpuratio=1 ;;
+	--disable-ceph)         disable_ceph=1 ;;
+	--disable-ha)           disable_ha=1 ;;
+	--disable-ovs)          disable_ovs=1 ;;
 
 	# CPU/memory thresholds
 	-wCPU|--warn-cpu)  shift; warn_cpu="${1}" ;;
@@ -482,7 +503,8 @@ _any_enabled=0
 for _ef in enable_sys enable_cluster enable_vm enable_ct enable_storage \
            enable_sub enable_repl enable_time enable_dns enable_net enable_disk \
            enable_psi enable_snap enable_backup enable_updates \
-           enable_services enable_log enable_vcpuratio enable_all; do
+           enable_services enable_log enable_vcpuratio \
+           enable_ceph enable_ha enable_ovs enable_all; do
 	[[ -n "${!_ef}" ]] && { _any_enabled=1; break; }
 done
 [[ "${_any_enabled}" -eq 0 ]] && { echo "Error: at least one -eX check flag required"; print_usage; exit 3; }
@@ -597,6 +619,12 @@ _pf_get "${PVE_API}/cluster/status"     cluster_status.json
 _pf_get "${PVE_API}/nodes"              nodes.json
 [[ ( -n "${enable_repl}" || -n "${enable_vm}" || -n "${enable_ct}" || -n "${enable_all}" ) ]] && \
 	_pf_get "${PVE_API}/cluster/replication" cluster_replication.json
+[[ ( -n "${enable_ceph}" || -n "${enable_all}" ) && -z "${disable_ceph}" ]] && \
+	_pf_get "${PVE_API}/cluster/ceph/status" ceph_status.json
+if [[ ( -n "${enable_ha}" || -n "${enable_all}" ) && -z "${disable_ha}" ]]; then
+	_pf_get "${PVE_API}/cluster/ha/status/current" ha_status.json
+	_pf_get "${PVE_API}/cluster/ha/resources"      ha_resources.json
+fi
 
 [[ -z "${no_prefetch}" ]] && wait  # collect parallel prefetch jobs
 
@@ -640,7 +668,8 @@ for _pfn in "${_all_nodes[@]}"; do
         _pf_get "${PVE_API}/nodes/${_pfn}/time"       "node_time_${_pfn}.json"
     [[ ( -n "${enable_dns}"  || -n "${enable_all}" ) && -z "${disable_dns}"  ]] && \
         _pf_get "${PVE_API}/nodes/${_pfn}/dns"        "node_dns_${_pfn}.json"
-    [[ ( -n "${enable_net}"  || -n "${enable_all}" ) && -z "${disable_net}"  ]] && \
+    [[ ( ( -n "${enable_net}" || -n "${enable_all}" ) && -z "${disable_net}" ) || \
+       ( ( -n "${enable_ovs}" || -n "${enable_all}" ) && -z "${disable_ovs}" ) ]] && \
         _pf_get "${PVE_API}/nodes/${_pfn}/network"    "node_net_${_pfn}.json"
     [[ ( ( -n "${enable_net}" || -n "${enable_all}" ) && -z "${disable_net}" && \
          ( -n "${warn_net_in}" || -n "${crit_net_in}" || -n "${warn_net_out}" || -n "${crit_net_out}" ) ) || \
@@ -2299,6 +2328,156 @@ if [[ ( -n "${enable_psi}" || -n "${enable_all}" ) && -z "${disable_psi}" ]]; th
 		pve_output+="${status_warn} - PSI: ${_psi_any_warn} node(s) warning\n"
 	else
 		pve_output+="${status_ok} - PSI: all nodes within thresholds\n"
+	fi
+	[[ -n "${verbose}" ]] && pve_output+="---------------------------------------\n\n"
+fi
+
+# ---------------------------------------------------------------------------
+# Ceph Cluster Health Check (-eCeph)
+# ---------------------------------------------------------------------------
+if [[ ( -n "${enable_ceph}" || -n "${enable_all}" ) && -z "${disable_ceph}" ]]; then
+	[[ -n "${verbose}" ]] && pve_output+="Ceph:\n---------------------------------------\n"
+	_ceph_buf=$(cat "${_pf}/ceph_status.json" 2>/dev/null)
+	_ceph_state="${status_ok}"
+
+	_ceph_errors=$(echo "${_ceph_buf}" | "${JQ}" -r '.errors // empty' 2>/dev/null)
+	_ceph_health=$(echo "${_ceph_buf}" | "${JQ}" -r '.data.health.status // empty' 2>/dev/null)
+
+	if [[ -n "${_ceph_errors}" || -z "${_ceph_health}" ]]; then
+		pve_output+="${status_ok} - Ceph: not available or not initialized\n"
+	else
+		_ceph_osds_total=$(echo "${_ceph_buf}" | "${JQ}" -r \
+			'.data.osdmap.num_osds // .data.osdmap.osdmap.num_osds // 0' 2>/dev/null)
+		_ceph_osds_up=$(echo "${_ceph_buf}" | "${JQ}" -r \
+			'.data.osdmap.num_up_osds // .data.osdmap.osdmap.num_up_osds // 0' 2>/dev/null)
+		_ceph_osds_in=$(echo "${_ceph_buf}" | "${JQ}" -r \
+			'.data.osdmap.num_in_osds // .data.osdmap.osdmap.num_in_osds // 0' 2>/dev/null)
+		_ceph_pgs=$(echo "${_ceph_buf}" | "${JQ}" -r '.data.pgmap.num_pgs // 0' 2>/dev/null)
+		_ceph_bytes_total=$(echo "${_ceph_buf}" | "${JQ}" -r '.data.pgmap.bytes_total // 0' 2>/dev/null)
+		_ceph_bytes_used=$(echo "${_ceph_buf}" | "${JQ}" -r '.data.pgmap.bytes_used // 0' 2>/dev/null)
+		_ceph_usage_pct=0
+		[[ "${_ceph_bytes_total:-0}" -gt 0 ]] 2>/dev/null && \
+			_ceph_usage_pct=$(( _ceph_bytes_used * 100 / _ceph_bytes_total ))
+
+		case "${_ceph_health}" in
+			HEALTH_OK)   _ceph_state="${status_ok}" ;;
+			HEALTH_WARN) _ceph_state="${status_warn}" ;;
+			HEALTH_ERR)  _ceph_state="${status_crit}" ;;
+			*)           _ceph_state="${status_warn}" ;;
+		esac
+
+		_ceph_msgs=$(echo "${_ceph_buf}" | "${JQ}" -r \
+			'[.data.health.checks // {} | to_entries[]? | "\(.key): \(.value.summary.message // "")"] | join("; ")' \
+			2>/dev/null)
+		_ceph_detail="OSDs: ${_ceph_osds_up}/${_ceph_osds_total} up ${_ceph_osds_in}/${_ceph_osds_total} in; PGs: ${_ceph_pgs}; usage: ${_ceph_usage_pct}%"
+		[[ -n "${_ceph_msgs}" ]] && _ceph_detail+=" [${_ceph_msgs}]"
+
+		pve_output+="${_ceph_state} - Ceph: ${_ceph_health} - ${_ceph_detail}\n"
+		[[ "${_ceph_state}" != "${status_ok}" ]] && \
+			pve_problem_output+="${_ceph_state} - Ceph: ${_ceph_health}${_ceph_msgs:+ [${_ceph_msgs}]}\n"
+
+		pve_perf+=" ceph_osds_total=${_ceph_osds_total} ceph_osds_up=${_ceph_osds_up}"
+		pve_perf+=" ceph_osds_in=${_ceph_osds_in} ceph_pgs=${_ceph_pgs} ceph_usage=${_ceph_usage_pct}%"
+	fi
+	[[ -n "${verbose}" ]] && pve_output+="---------------------------------------\n\n"
+fi
+
+# ---------------------------------------------------------------------------
+# HA Resource Manager Check (-eHA)
+# ---------------------------------------------------------------------------
+if [[ ( -n "${enable_ha}" || -n "${enable_all}" ) && -z "${disable_ha}" ]]; then
+	[[ -n "${verbose}" ]] && pve_output+="HA:\n---------------------------------------\n"
+	_ha_status_buf=$(cat "${_pf}/ha_status.json"    2>/dev/null)
+	_ha_res_buf=$(cat "${_pf}/ha_resources.json"    2>/dev/null)
+	_ha_state="${status_ok}"
+
+	_ha_master_node=$(echo "${_ha_status_buf}" | "${JQ}" -r \
+		'.data[]? | select(.type=="master") | .node // empty' 2>/dev/null | head -1)
+
+	if [[ -z "${_ha_master_node}" ]]; then
+		pve_output+="${status_ok} - HA: not configured or no master node active\n"
+	else
+		_ha_res_total=0; _ha_res_started=0; _ha_res_stopped=0
+		_ha_res_error=0; _ha_res_other=0
+		_ha_err_list=""
+
+		while IFS=$'\t' read -r _ha_sid _ha_rstate; do
+			[[ -z "${_ha_sid}" ]] && continue
+			(( _ha_res_total++ ))
+			case "${_ha_rstate}" in
+				started)           (( _ha_res_started++ )) ;;
+				stopped|disabled)  (( _ha_res_stopped++ )) ;;
+				error|fence)
+					(( _ha_res_error++ ))
+					_ha_state="${status_crit}"
+					_ha_err_list+="${_ha_sid}(${_ha_rstate}) "
+					;;
+				*)                 (( _ha_res_other++ )) ;;
+			esac
+			[[ -n "${verbose}" ]] && \
+				pve_output+="${status_ok} -   ${_ha_sid}: ${_ha_rstate}\n"
+		done < <(echo "${_ha_res_buf}" | "${JQ}" --unbuffered -r \
+			'.data[]? | [(.sid // ""), (.state // "")] | join("\t")' 2>/dev/null)
+
+		_ha_detail="master: ${_ha_master_node}; resources: ${_ha_res_total} total"
+		[[ "${_ha_res_started}" -gt 0 ]] && _ha_detail+=", ${_ha_res_started} started"
+		[[ "${_ha_res_stopped}" -gt 0 ]] && _ha_detail+=", ${_ha_res_stopped} stopped"
+		[[ "${_ha_res_error}"   -gt 0 ]] && _ha_detail+=", ${_ha_res_error} error/fence"
+		[[ "${_ha_res_other}"   -gt 0 ]] && _ha_detail+=", ${_ha_res_other} other"
+
+		pve_output+="${_ha_state} - HA: ${_ha_detail}\n"
+		[[ "${_ha_state}" != "${status_ok}" ]] && \
+			pve_problem_output+="${_ha_state} - HA: ${_ha_res_error} resource(s) in error/fence state: ${_ha_err_list% }\n"
+
+		pve_perf+=" ha_resources_total=${_ha_res_total} ha_resources_started=${_ha_res_started}"
+		pve_perf+=" ha_resources_error=${_ha_res_error}"
+	fi
+	[[ -n "${verbose}" ]] && pve_output+="---------------------------------------\n\n"
+fi
+
+# ---------------------------------------------------------------------------
+# OpenVSwitch Interface Check (-eOVS)
+# ---------------------------------------------------------------------------
+if [[ ( -n "${enable_ovs}" || -n "${enable_all}" ) && -z "${disable_ovs}" ]]; then
+	[[ -n "${verbose}" ]] && pve_output+="OpenVSwitch:\n---------------------------------------\n"
+	_ovs_state="${status_ok}"
+	_ovs_total=0; _ovs_down=0
+	_ovs_verbose_buf=""
+	_ovs_problem_buf=""
+
+	for _ovs_node in "${_all_nodes[@]}"; do
+		_ovs_net_buf=$(cat "${_pf}/node_net_${_ovs_node}.json" 2>/dev/null)
+		[[ -z "${_ovs_net_buf}" ]] && continue
+
+		while IFS=$'\t' read -r _ovs_iface _ovs_type _ovs_active; do
+			[[ -z "${_ovs_iface}" ]] && continue
+			[[ "${_ovs_type}" != OVS* ]] && continue
+			(( _ovs_total++ ))
+
+			if [[ "${_ovs_active}" == "1" ]]; then
+				_ovs_istate="${status_ok}"; _ovs_link="up"
+			else
+				_ovs_istate="${status_crit}"; _ovs_link="down"
+				(( _ovs_down++ ))
+				[[ "${_ovs_state}" != "${status_crit}" ]] && _ovs_state="${status_crit}"
+				_ovs_problem_buf+="${status_crit} - OVS ${_ovs_node}/${_ovs_iface} (${_ovs_type}): down\n"
+			fi
+			_ovs_verbose_buf+="${_ovs_istate} -   ${_ovs_node}/${_ovs_iface} (${_ovs_type}): ${_ovs_link}\n"
+		done < <(echo "${_ovs_net_buf}" | "${JQ}" --unbuffered -r '
+			.data[]? | [
+				(.iface // ""),
+				(.type  // ""),
+				((.active // 0) | tostring)
+			] | join("\t")' 2>/dev/null)
+	done
+
+	if [[ "${_ovs_total}" -eq 0 ]]; then
+		pve_output+="${status_ok} - OVS: no OpenVSwitch interfaces configured\n"
+	else
+		pve_output+="${_ovs_state} - OVS: ${_ovs_total} interface(s), ${_ovs_down} down\n"
+		[[ -n "${verbose}" ]] && pve_output+="${_ovs_verbose_buf}"
+		[[ -n "${_ovs_problem_buf}" ]] && pve_problem_output+="${_ovs_problem_buf}"
+		pve_perf+=" ovs_total=${_ovs_total} ovs_down=${_ovs_down}"
 	fi
 	[[ -n "${verbose}" ]] && pve_output+="---------------------------------------\n\n"
 fi
